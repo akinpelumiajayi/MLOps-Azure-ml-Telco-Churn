@@ -1,0 +1,11 @@
+name: train-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      - mlflow<3
+      - azureml-mlflow
+      - scikit-learn==1.5.2
+      - pandas

@@ -1,0 +1,57 @@
+name: infra
+
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**"]
+  pull_request:
+    paths: ["infra/**"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: infra-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # Read by infra/main.bicepparam
+      AML_ISOLATION_MODE: ${{ vars.AML_ISOLATION_MODE || 'AllowInternetOutbound' }}
+      AML_PRIVATE_ENDPOINTS: ${{ vars.AML_PRIVATE_ENDPOINTS || 'false' }}
+      ALERT_EMAIL: ${{ vars.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint Bicep
+        run: az bicep build --file infra/main.bicep --stdout > /dev/null
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Preview changes (what-if)
+        run: |
+          az deployment group what-if \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam
+      - name: Deploy
+        if: github.event_name != 'pull_request'
+        run: |
+          az deployment group create \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --template-file infra/main.bicep \
+            --parameters infra/main.bicepparam
+      - name: Provision managed network (incl. serverless Spark for drift monitoring)
+        if: github.event_name != 'pull_request' && env.AML_ISOLATION_MODE != 'Disabled'
+        run: |
+          az extension add -n ml -y
+          az ml workspace provision-network \
+            --resource-group "${{ vars.AZURE_RESOURCE_GROUP }}" \
+            --name "${{ vars.AZURE_ML_WORKSPACE }}" \
+            --include-spark

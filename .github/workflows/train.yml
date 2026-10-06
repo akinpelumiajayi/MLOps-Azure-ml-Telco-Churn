@@ -1,0 +1,150 @@
+name: train
+
+on:
+  push:
+    branches: [main]
+    paths: ["src/**", "data/**", "environments/**", "mlops/azureml/train-job.yml", "mlops/azureml/data.yml"]
+  pull_request:
+    paths: ["src/**", "data/**", "environments/**", "tests/**", "mlops/azureml/**", "scripts/**"]
+  workflow_dispatch:
+    inputs:
+      min_delta:
+        description: "Required r2 improvement over production (negative allows a small regression)"
+        required: false
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+# One training run per branch at a time; a newer push supersedes a queued one.
+concurrency:
+  group: train-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: pytest
+      - name: Shellcheck helper scripts
+        run: shellcheck scripts/*.sh
+
+  train:
+    # Submits the Azure ML job only from main / manual runs (PRs just run tests).
+    if: github.event_name != 'pull_request'
+    needs: test
+    # Set RUNNER_LABEL to a self-hosted runner inside the VNet once the
+    # workspace's public network access is disabled.
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 90
+    env:
+      MODEL_NAME: diabetes-rf
+      DATA_NAME: diabetes-data
+      ENDPOINT_NAME: ${{ vars.ENDPOINT_NAME }}
+      MIN_DELTA: ${{ inputs.min_delta || vars.GATE_MIN_DELTA || '0.0' }}
+      MIN_R2: ${{ vars.GATE_MIN_R2 || '0.3' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Install Azure ML CLI extension
+        run: az extension add -n ml -y
+      - name: Set defaults
+        run: az configure --defaults group=${{ vars.AZURE_RESOURCE_GROUP }} workspace=${{ vars.AZURE_ML_WORKSPACE }}
+
+      - name: Register data asset (content-addressed version)
+        id: data
+        run: |
+          # Same bytes -> same version, so reruns reuse the asset and every model
+          # traces back to the exact data it was trained on.
+          VERSION=$({ cat mlops/azureml/data.yml; find data/diabetes -type f -print0 | sort -z | xargs -0 cat; } \
+            | sha256sum | cut -c1-12)
+          if az ml data show --name "$DATA_NAME" --version "$VERSION" >/dev/null 2>&1; then
+            echo "Data asset $DATA_NAME:$VERSION already registered"
+          else
+            az ml data create --file mlops/azureml/data.yml --version "$VERSION" -o none
+            echo "Registered $DATA_NAME:$VERSION"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Find production model (baseline for the quality gate)
+        id: prod
+        run: |
+          bash scripts/endpoint_state.sh "$ENDPOINT_NAME" "$MODEL_NAME" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Submit training job
+        id: job
+        run: |
+          JOB=$(az ml job create --file mlops/azureml/train-job.yml \
+            --set inputs.training_data.path="azureml:$DATA_NAME:${{ steps.data.outputs.version }}" \
+                  inputs.baseline_version="${{ steps.prod.outputs.live_version || 'none' }}" \
+                  inputs.min_r2="$MIN_R2" \
+                  inputs.min_delta="$MIN_DELTA" \
+                  inputs.git_sha="$GITHUB_SHA" \
+                  tags.git_sha="$GITHUB_SHA" \
+                  tags.github_run="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --query name -o tsv)
+          echo "name=$JOB" >> "$GITHUB_OUTPUT"
+          echo "Submitted $JOB: $(az ml job show --name "$JOB" --query services.Studio.endpoint -o tsv)"
+
+      - name: Wait for training job
+        run: |
+          JOB="${{ steps.job.outputs.name }}"
+          az ml job stream --name "$JOB" || true   # stream can drop on long jobs; status below is authoritative
+          STATUS=$(az ml job show --name "$JOB" --query status -o tsv)
+          until [[ "$STATUS" =~ ^(Completed|Failed|Canceled|NotResponding)$ ]]; do
+            sleep 30; STATUS=$(az ml job show --name "$JOB" --query status -o tsv)
+          done
+          echo "Job $JOB finished with status $STATUS"
+          [ "$STATUS" = "Completed" ]
+
+      - name: Cancel training job on workflow cancel
+        if: cancelled() && steps.job.outputs.name != ''
+        run: az ml job cancel --name "${{ steps.job.outputs.name }}" || true
+
+      - name: Read quality gate result
+        id: gate
+        run: |
+          az ml job download --name "${{ steps.job.outputs.name }}" --output-name gate --download-path gate-download
+          GATE_FILE=$(find gate-download -name gate.json | head -n1)
+          [ -n "$GATE_FILE" ] || { echo "::error::gate.json not found in job output"; exit 1; }
+          mkdir -p candidate && cp "$GATE_FILE" candidate/gate.json
+          jq . candidate/gate.json
+          echo "passed=$(jq -r .passed candidate/gate.json)" >> "$GITHUB_OUTPUT"
+          echo "model_version=$(jq -r '.model_version // ""' candidate/gate.json)" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Quality gate: $(jq -r 'if .passed then "✅ passed" else "❌ rejected" end' candidate/gate.json)"
+            echo
+            jq -r .reason candidate/gate.json
+            echo
+            echo "| | value |"
+            echo "|---|---|"
+            jq -r '.metrics | to_entries[] | "| \(.key) | \(.value | tostring) |"' candidate/gate.json
+            echo "| data | $DATA_NAME:${{ steps.data.outputs.version }} |"
+            echo "| production baseline | ${{ steps.prod.outputs.live_version || 'none' }} |"
+            echo "| registered version | $(jq -r '.model_version // "—"' candidate/gate.json) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # deploy.yml (workflow_run) reads this artifact to know which version to roll out.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: candidate
+          path: candidate/gate.json
+          retention-days: 30
+
+      - name: Enforce quality gate
+        if: steps.gate.outputs.passed != 'true'
+        run: |
+          echo "::error::Candidate rejected by quality gate: $(jq -r .reason candidate/gate.json)"
+          exit 1

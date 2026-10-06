@@ -1,0 +1,236 @@
+name: deploy
+
+# Blue/green rollout of a registered model version to the managed online endpoint.
+#  - Automatic: after a successful `train` run on main (the quality gate passed).
+#  - Manual: pick a version, or blank for the latest version that passed the gate.
+# Keep required reviewers on the `production` environment until you trust the gate;
+# remove them to make the pipeline fully continuous.
+on:
+  workflow_run:
+    workflows: [train]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      model_version:
+        description: "Model version to deploy (blank = latest version that passed the gate)"
+        required: false
+        default: ""
+      traffic_steps:
+        description: "Space-separated % of traffic for the new slot (default: vars.TRAFFIC_STEPS or '10 50 100')"
+        required: false
+        default: ""
+      force:
+        description: "Redeploy even if this version is already live"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read   # download the gate artifact from the triggering train run
+
+# Never run two rollouts against the endpoint at once; queue instead of cancelling.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event != 'pull_request')
+    runs-on: ${{ vars.RUNNER_LABEL || 'ubuntu-latest' }}
+    timeout-minutes: 120
+    environment: production
+    env:
+      MODEL_NAME: diabetes-rf
+      ENDPOINT_NAME: ${{ vars.ENDPOINT_NAME }}
+      MONITOR_NAME: diabetes-rf-monitor
+      TRAFFIC_STEPS: ${{ inputs.traffic_steps || vars.TRAFFIC_STEPS || '10 50 100' }}
+      BAKE_SECONDS: ${{ vars.BAKE_SECONDS || '300' }}
+      REQUEST_FILE: mlops/azureml/sample-request.json
+    steps:
+      # Deploy the specs from the commit that produced the model, not whatever main is now.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Download gate result from train run
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: candidate
+          path: candidate
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - run: az extension add -n ml -y
+      - run: az configure --defaults group=${{ vars.AZURE_RESOURCE_GROUP }} workspace=${{ vars.AZURE_ML_WORKSPACE }}
+
+      - name: Resolve model version
+        id: model
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            [ "$(jq -r .passed candidate/gate.json)" = "true" ] \
+              || { echo "::error::Triggering train run did not pass the quality gate"; exit 1; }
+            VERSION=$(jq -r .model_version candidate/gate.json)
+          elif [ -n "${{ inputs.model_version }}" ]; then
+            VERSION="${{ inputs.model_version }}"
+          else
+            VERSION=$(az ml model list --name "$MODEL_NAME" \
+              --query "max_by([?tags.gate=='passed'], &to_number(version)).version" -o tsv)
+          fi
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "::error::No model version to deploy"; exit 1
+          fi
+          az ml model show --name "$MODEL_NAME" --version "$VERSION" -o none \
+            || { echo "::error::$MODEL_NAME:$VERSION is not registered"; exit 1; }
+          echo "Candidate: $MODEL_NAME:$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Read endpoint state
+        id: slots
+        run: bash scripts/endpoint_state.sh "$ENDPOINT_NAME" "$MODEL_NAME" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Plan rollout
+        id: plan
+        run: |
+          if [ "${{ steps.slots.outputs.live_version }}" = "${{ steps.model.outputs.version }}" ] \
+             && [ "${{ inputs.force }}" != "true" ]; then
+            echo "::notice::$MODEL_NAME:${{ steps.model.outputs.version }} is already live on ${{ steps.slots.outputs.live }}; nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "Rollout: ${{ steps.slots.outputs.live || '(none)' }} -> ${{ steps.slots.outputs.idle }} with $MODEL_NAME:${{ steps.model.outputs.version }}"
+
+      - name: Create endpoint if missing
+        if: steps.plan.outputs.skip == 'false' && steps.slots.outputs.exists != 'true'
+        run: |
+          az ml online-endpoint create --file mlops/azureml/endpoint.yml \
+            --set name="$ENDPOINT_NAME" public_network_access="${{ vars.ENDPOINT_PUBLIC_ACCESS || 'enabled' }}"
+
+      - name: Deploy to idle slot (0% traffic)
+        id: stage
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          LIVE: ${{ steps.slots.outputs.live }}
+          IDLE: ${{ steps.slots.outputs.idle }}
+        run: |
+          # Guarantee the idle slot takes no traffic (e.g. after an interrupted rollout).
+          if [ -n "$LIVE" ] && az ml online-deployment show --name "$IDLE" --endpoint-name "$ENDPOINT_NAME" -o none 2>/dev/null; then
+            az ml online-endpoint update --name "$ENDPOINT_NAME" --traffic "$LIVE=100 $IDLE=0" -o none
+          fi
+
+          ARGS=(--file mlops/azureml/deployment.yml
+                --set name="$IDLE" endpoint_name="$ENDPOINT_NAME"
+                      model="azureml:$MODEL_NAME:${{ steps.model.outputs.version }}")
+          if az ml online-deployment show --name "$IDLE" --endpoint-name "$ENDPOINT_NAME" -o none 2>/dev/null; then
+            az ml online-deployment update "${ARGS[@]}" -o none
+          else
+            az ml online-deployment create "${ARGS[@]}" -o none
+          fi
+
+      - name: Smoke test idle slot
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          IDLE: ${{ steps.slots.outputs.idle }}
+        run: |
+          # Call the slot directly (bypasses traffic split) and validate the response shape.
+          ROWS=$(jq '.input_data.data | length' "$REQUEST_FILE")
+          RESP=$(az ml online-endpoint invoke --name "$ENDPOINT_NAME" --deployment-name "$IDLE" --request-file "$REQUEST_FILE")
+          echo "Response: $RESP"
+          jq -e --argjson n "$ROWS" \
+            '(if type == "string" then fromjson else . end) | type == "array" and length == $n and all(.[]; type == "number")' \
+            <<<"$RESP" >/dev/null || { echo "::error::Unexpected response from $IDLE"; exit 1; }
+
+      - name: Shift traffic gradually
+        id: rollout
+        if: steps.plan.outputs.skip == 'false'
+        env:
+          LIVE: ${{ steps.slots.outputs.live }}
+          IDLE: ${{ steps.slots.outputs.idle }}
+        run: |
+          check_health() {
+            local state
+            state=$(az ml online-deployment show --name "$IDLE" --endpoint-name "$ENDPOINT_NAME" --query provisioning_state -o tsv)
+            [ "$state" = "Succeeded" ] || { echo "::error::$IDLE provisioning_state=$state"; return 1; }
+            for _ in 1 2 3 4 5; do
+              az ml online-endpoint invoke --name "$ENDPOINT_NAME" --deployment-name "$IDLE" \
+                --request-file "$REQUEST_FILE" -o none || { echo "::error::$IDLE failed a health probe"; return 1; }
+            done
+          }
+
+          if [ -z "$LIVE" ]; then
+            # First deployment: nothing to shift from.
+            az ml online-endpoint update --name "$ENDPOINT_NAME" --traffic "$IDLE=100" -o none
+            echo "completed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          read -ra STEPS <<<"$TRAFFIC_STEPS"
+          [ "${STEPS[-1]}" = "100" ] || STEPS+=(100)
+          for PCT in "${STEPS[@]}"; do
+            if ! [[ "$PCT" =~ ^[0-9]+$ ]] || [ "$PCT" -gt 100 ]; then
+              echo "::error::Invalid traffic step '$PCT'"; exit 1
+            fi
+            echo "::group::$IDLE=$PCT% $LIVE=$((100 - PCT))%"
+            az ml online-endpoint update --name "$ENDPOINT_NAME" --traffic "$LIVE=$((100 - PCT)) $IDLE=$PCT" -o none
+            if [ "$PCT" -lt 100 ]; then
+              echo "Baking for ${BAKE_SECONDS}s"
+              sleep "$BAKE_SECONDS"
+            fi
+            check_health
+            echo "::endgroup::"
+          done
+          echo "completed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Roll back traffic
+        if: >-
+          failure() && steps.plan.outputs.skip == 'false' &&
+          steps.slots.outputs.live != '' && steps.rollout.outputs.completed != 'true'
+        run: |
+          echo "::error::Rollout failed; restoring 100% traffic to ${{ steps.slots.outputs.live }}"
+          az ml online-endpoint update --name "$ENDPOINT_NAME" \
+            --traffic "${{ steps.slots.outputs.live }}=100 ${{ steps.slots.outputs.idle }}=0" -o none
+
+      - name: Tag model stages
+        if: steps.rollout.outputs.completed == 'true'
+        run: |
+          NEW="${{ steps.model.outputs.version }}"
+          OLD="${{ steps.slots.outputs.live_version }}"
+          az ml model update --name "$MODEL_NAME" --version "$NEW" --set tags.stage=production -o none
+          if [ -n "$OLD" ] && [ "$OLD" != "$NEW" ]; then
+            az ml model update --name "$MODEL_NAME" --version "$OLD" --set tags.stage=archived -o none
+          fi
+
+      - name: Point drift monitor at the live slot
+        if: steps.rollout.outputs.completed == 'true'
+        # Monitoring problems must not fail (or roll back) a healthy deployment.
+        continue-on-error: true
+        run: |
+          az ml schedule create --file mlops/azureml/monitor.yml \
+            --set create_monitor.monitoring_target.endpoint_deployment_id="azureml:$ENDPOINT_NAME:${{ steps.slots.outputs.idle }}" \
+            -o none
+
+      - name: Summary
+        if: always() && steps.plan.outputs.skip == 'false'
+        run: |
+          {
+            echo "### Deploy $MODEL_NAME:${{ steps.model.outputs.version }} → \`${{ steps.slots.outputs.idle }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| previous | ${{ steps.slots.outputs.live || '—' }} (v${{ steps.slots.outputs.live_version || '—' }}) |"
+            echo "| rollout completed | ${{ steps.rollout.outputs.completed || 'false' }} |"
+            echo "| traffic now | \`$(az ml online-endpoint show --name "$ENDPOINT_NAME" --query traffic -o json 2>/dev/null | jq -c . || echo n/a)\` |"
+            echo
+            echo "The previous slot stays deployed at 0% for instant rollback:"
+            echo "\`az ml online-endpoint update -n $ENDPOINT_NAME --traffic \"${{ steps.slots.outputs.live || 'blue' }}=100 ${{ steps.slots.outputs.idle }}=0\"\`"
+          } >> "$GITHUB_STEP_SUMMARY"

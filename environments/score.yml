@@ -1,0 +1,14 @@
+name: score-env
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - pip:
+      # Keep mlflow / scikit-learn pinned to the same versions as conda.yml
+      # so the pickled model loads with the library that produced it.
+      - mlflow<3
+      - scikit-learn==1.5.2
+      - pandas
+      - azureml-inference-server-http
+      - azureml-ai-monitoring

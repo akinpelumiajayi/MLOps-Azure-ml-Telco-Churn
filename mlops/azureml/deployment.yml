@@ -1,0 +1,33 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineDeployment.schema.json
+# The deploy workflow overrides name (blue | green), endpoint_name and model.
+name: blue
+endpoint_name: placeholder-endpoint
+model: azureml:diabetes-rf:1
+code_configuration:
+  code: ../../src
+  scoring_script: score.py
+environment:
+  image: mcr.microsoft.com/azureml/openmpi4.1.2-ubuntu20.04:latest
+  conda_file: ../../environments/score.yml
+instance_type: Standard_DS3_v2
+instance_count: 1
+# Request logs, latency and failures go to the workspace's Application Insights.
+app_insights_enabled: true
+# Captures request inputs / predictions to blob storage for drift monitoring.
+data_collector:
+  collections:
+    model_inputs:
+      enabled: "True"
+    model_outputs:
+      enabled: "True"
+request_settings:
+  request_timeout_ms: 5000
+  max_concurrent_requests_per_instance: 2
+liveness_probe:
+  initial_delay: 30
+  period: 10
+  failure_threshold: 30
+readiness_probe:
+  initial_delay: 10
+  period: 10
+  failure_threshold: 3

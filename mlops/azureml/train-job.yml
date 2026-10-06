@@ -1,0 +1,36 @@
+$schema: https://azuremlschemas.azureedge.net/latest/commandJob.schema.json
+display_name: train-diabetes-rf
+experiment_name: diabetes-rf
+code: ../../src
+command: >-
+  python train.py
+  --data ${{inputs.training_data}}
+  --n_estimators ${{inputs.n_estimators}}
+  --max_depth ${{inputs.max_depth}}
+  --model_name ${{inputs.model_name}}
+  --baseline_version ${{inputs.baseline_version}}
+  --min_r2 ${{inputs.min_r2}}
+  --min_delta ${{inputs.min_delta}}
+  --git_sha ${{inputs.git_sha}}
+  --gate_output ${{outputs.gate}}
+# The train workflow overrides training_data (exact data version), baseline_version
+# (the model currently serving production traffic) and git_sha.
+inputs:
+  training_data:
+    type: mltable
+    path: azureml:diabetes-data@latest
+    mode: ro_mount
+  n_estimators: 200
+  max_depth: 8
+  model_name: diabetes-rf
+  baseline_version: none
+  min_r2: 0.3
+  min_delta: 0.0
+  git_sha: local
+outputs:
+  gate:
+    type: uri_folder
+environment:
+  image: mcr.microsoft.com/azureml/openmpi4.1.2-ubuntu20.04:latest
+  conda_file: ../../environments/conda.yml
+compute: azureml:cpu-cluster

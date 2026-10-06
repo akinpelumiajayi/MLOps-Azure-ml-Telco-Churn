@@ -1,0 +1,12 @@
+$schema: https://azuremlschemas.azureedge.net/latest/data.schema.json
+# Training data, registered as an MLTable so the same asset serves as the
+# training input and as the reference dataset for drift monitoring.
+# The train workflow sets `version` to a hash of the data, so unchanged data
+# reuses the existing version and changed data gets a new one.
+# To train on data that lands in a datastore instead of the repo, point `path`
+# at a folder containing an MLTable file, e.g.
+#   path: azureml://datastores/<datastore>/paths/diabetes/
+name: diabetes-data
+type: mltable
+path: ../../data/diabetes
+description: Diabetes progression dataset (10 standardised features + target).

@@ -1,0 +1,4 @@
+mlflow<3
+scikit-learn==1.5.2
+pandas
+pytest

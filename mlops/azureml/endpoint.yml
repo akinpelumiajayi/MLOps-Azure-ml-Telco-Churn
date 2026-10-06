@@ -1,0 +1,7 @@
+$schema: https://azuremlschemas.azureedge.net/latest/managedOnlineEndpoint.schema.json
+# `name` must be unique per Azure region; the deploy workflow overrides it
+# with the ENDPOINT_NAME repo variable, and public_network_access with
+# ENDPOINT_PUBLIC_ACCESS (set it to "disabled" for private-endpoint-only access).
+name: placeholder-endpoint
+auth_mode: key
+public_network_access: enabled
